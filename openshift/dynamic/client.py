@@ -3,6 +3,7 @@
 import sys
 import json
 from functools import partial
+from abc import abstractmethod, abstractproperty
 
 import yaml
 from pprint import pformat
@@ -25,7 +26,7 @@ __all__ = [
     'ResourceInstance',
     'Resource',
     'Subresource',
-    'ResourceContainer',
+    'EagerDiscoverer',
     'ResourceField',
 ]
 
@@ -44,11 +45,13 @@ def meta_request(func):
 
     return inner
 
+
 def serialize(resource, response):
     try:
         return ResourceInstance(resource, load_json(response))
     except ValueError:
         return response.data.decode()
+
 
 def load_json(response):
     return json.loads(response.data.decode())
@@ -59,11 +62,11 @@ class DynamicClient(object):
         the kubernetes API
     """
 
-    def __init__(self, client):
+    def __init__(self, client, discoverer=None):
         self.client = client
         self.configuration = client.configuration
         self._load_server_info()
-        self.__resources = ResourceContainer(self.parse_api_groups())
+        self.__discoverer = discoverer or EagerDiscoverer(self)
 
     def _load_server_info(self):
         self.__version = {'kubernetes': load_json(self.request('get', '/version'))}
@@ -74,74 +77,11 @@ class DynamicClient(object):
 
     @property
     def resources(self):
-        return self.__resources
+        return self.__discoverer
 
     @property
     def version(self):
         return self.__version
-
-    def default_groups(self):
-        groups = {}
-        groups['api'] = { '': {
-            'v1': self.get_resources_for_api_version('api', '', 'v1', True)
-        }}
-
-        if self.version.get('openshift'):
-            groups['oapi'] = { '': {
-                'v1': self.get_resources_for_api_version('oapi', '', 'v1', True)
-            }}
-
-        return groups
-
-    def parse_api_groups(self):
-        """ Discovers all API groups present in the cluster """
-        prefix = 'apis'
-        groups_response = load_json(self.request('GET', '/{}'.format(prefix)))['groups']
-
-        groups = self.default_groups()
-        groups[prefix] = {}
-
-        for group in groups_response:
-            new_group = {}
-            for version_raw in group['versions']:
-                version = version_raw['version']
-                preferred = version_raw == group['preferredVersion']
-                new_group[version] = self.get_resources_for_api_version(prefix, group['name'], version, preferred)
-            groups[prefix][group['name']] = new_group
-        return groups
-
-    def get_resources_for_api_version(self, prefix, group, version, preferred):
-        """ returns a dictionary of resources associated with provided groupVersion"""
-
-        resources = {}
-        subresources = {}
-
-        path = '/'.join(filter(None, [prefix, group, version]))
-        resources_response = load_json(self.request('GET', path))['resources']
-
-        resources_raw = list(filter(lambda resource: '/' not in resource['name'], resources_response))
-        subresources_raw = list(filter(lambda resource: '/' in resource['name'], resources_response))
-        for subresource in subresources_raw:
-            resource, name = subresource['name'].split('/')
-            if not subresources.get(resource):
-                subresources[resource] = {}
-            subresources[resource][name] = subresource
-
-        for resource in resources_raw:
-            # Prevent duplicate keys
-            for key in ('prefix', 'group', 'api_version', 'client', 'preferred'):
-                resource.pop(key, None)
-
-            resources[resource['kind']] = Resource(
-                prefix=prefix,
-                group=group,
-                api_version=version,
-                client=self,
-                preferred=preferred,
-                subresources=subresources.get(resource['name']),
-                **resource
-            )
-        return resources
 
     def ensure_namespace(self, resource, namespace, body):
         namespace = namespace or body.get('metadata', {}).get('namespace')
@@ -255,7 +195,7 @@ class DynamicClient(object):
             header_params,
             body=body,
             post_params=form_params,
-            async_req=params.get('async_req'),
+            async=params.get('async'),
             files=local_var_files,
             auth_settings=auth_settings,
             _preload_content=False,
@@ -377,20 +317,6 @@ class Subresource(Resource):
         self.verbs = kwargs.pop('verbs', None)
         self.extra_args = kwargs
 
-    #TODO(fabianvf): Determine proper way to handle differences between resources + subresources
-    def create(self, body=None, name=None, namespace=None, **kwargs):
-        return self.__create(self, body=body, name=name, namespace=namespace, **kwargs)
-
-    @meta_request
-    def __create(self, resource, body=None, name=None, namespace=None, **kwargs):
-        name = name or body.get('metadata', {}).get('name')
-        body = self.parent.client.serialize_body(body)
-        if resource.namespaced:
-            namespace = self.parent.client.ensure_namespace(resource, namespace, body)
-        path = self.path(name=name, namespace=namespace)
-        return self.parent.client.request('post', path, body=body, **kwargs)
-
-
     @property
     def urls(self):
         full_prefix = '{}/{}'.format(self.prefix, self.group_version)
@@ -403,18 +329,119 @@ class Subresource(Resource):
         return partial(getattr(self.parent.client, name), self)
 
 
-class ResourceContainer(object):
+class Discoverer(object):
+
+    @abstractproperty
+    def api_groups(self):
+        pass
+
+    @abstractmethod
+    def get(self, kind=None, api_version=None, prefix=None, **kwargs):
+        pass
+
+    @abstractmethod
+    def search(self, kind=None, api_version=None, prefix=None, **kwargs):
+        pass
+
+    def get_resources_for_api_version(self, prefix, group, version, preferred):
+        """ returns a dictionary of resources associated with provided groupVersion"""
+
+        resources = {}
+        subresources = {}
+
+        path = '/'.join(filter(None, [prefix, group, version]))
+        resources_response = load_json(self.client.request('GET', path))['resources']
+
+        resources_raw = list(filter(lambda resource: '/' not in resource['name'], resources_response))
+        subresources_raw = list(filter(lambda resource: '/' in resource['name'], resources_response))
+        for subresource in subresources_raw:
+            resource, name = subresource['name'].split('/')
+            if not subresources.get(resource):
+                subresources[resource] = {}
+            subresources[resource][name] = subresource
+
+        for resource in resources_raw:
+            # Prevent duplicate keys
+            for key in ('prefix', 'group', 'api_version', 'client', 'preferred'):
+                resource.pop(key, None)
+
+            resources[resource['kind']] = Resource(
+                prefix=prefix,
+                group=group,
+                api_version=version,
+                client=self,
+                preferred=preferred,
+                subresources=subresources.get(resource['name']),
+                **resource
+            )
+        return resources
+
+    def default_groups(self, getResources=False):
+        groups = {}
+        groups['api'] = { '': {
+            'v1': self.get_resources_for_api_version('api', '', 'v1', True) if getResources else {}
+        }}
+
+        # TODO probably shouldn't rely on client field
+        if self.client.version.get('openshift'):
+            groups['oapi'] = { '': {
+                'v1': self.get_resources_for_api_version('oapi', '', 'v1', True) if getResources else {}
+            }}
+
+        return groups
+
+
+
+class LazyDiscoverer(Discoverer):
+
+    def __init__(self, client):
+        self.client = client
+
+    def api_groups(self):
+        pass
+
+    def get(self, kind=None, api_version=None, prefix=None, **kwargs):
+        pass
+
+    def search(self, kind=None, api_version=None, prefix=None, **kwargs):
+        pass
+
+
+class EagerDiscoverer(Discoverer):
     """ A convenient container for storing discovered API resources. Allows
         easy searching and retrieval of specific resources
     """
 
-    def __init__(self, resources):
-        self.__resources = resources
+    def __init__(self, client):
+        self.client = client
+        self.discover()
+
+    def discover(self):
+        self.__resources = self.parse_api_groups()
+
+    def parse_api_groups(self):
+        """ Discovers all API groups present in the cluster """
+        prefix = 'apis'
+        groups_response = load_json(self.client.request('GET', '/{}'.format(prefix)))['groups']
+
+        groups = self.default_groups()
+        groups[prefix] = {}
+
+        for group in groups_response:
+            new_group = {}
+            for version_raw in group['versions']:
+                version = version_raw['version']
+                preferred = version_raw == group['preferredVersion']
+                new_group[version] = self.get_resources_for_api_version(prefix, group['name'], version, preferred)
+            groups[prefix][group['name']] = new_group
+        return groups
+
 
     @property
     def api_groups(self):
         """ list available api groups """
         return self.__resources['apis'].keys()
+
 
     def get(self, **kwargs):
         """ Same as search, but will throw an error if there are multiple or no
@@ -446,12 +473,12 @@ class ResourceContainer(object):
         """
         return self.__search(self.__build_search(**kwargs), self.__resources)
 
-    def __build_search(self, kind=None, api_version=None, prefix=None, **kwargs):
-        if api_version and '/' in api_version:
+    def __build_search(self, prefix=None, group=None, api_version=None, kind=None, **kwargs):
+        if not group and api_version and '/' in api_version:
             group, version = api_version.split('/')
             items = [prefix, group, version, kind, kwargs]
         else:
-            items = [prefix, '*', api_version, kind, kwargs]
+            items = [prefix, group, api_version, kind, kwargs]
 
         return list(map(lambda x: x or '*', items))
 
