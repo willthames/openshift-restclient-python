@@ -66,7 +66,8 @@ class DynamicClient(object):
         self.client = client
         self.configuration = client.configuration
         self._load_server_info()
-        self.__discoverer = discoverer or EagerDiscoverer(self)
+        import pdb; pdb.set_trace()
+        self.__discoverer = discoverer or LazyDiscoverer(self)
 
     def _load_server_info(self):
         self.__version = {'kubernetes': load_json(self.request('get', '/version'))}
@@ -336,11 +337,11 @@ class Discoverer(object):
         pass
 
     @abstractmethod
-    def get(self, kind=None, api_version=None, prefix=None, **kwargs):
+    def get(self, prefix=None, group=None, api_version=None, kind=None, **kwargs):
         pass
 
     @abstractmethod
-    def search(self, kind=None, api_version=None, prefix=None, **kwargs):
+    def search(self, prefix=None, group=None, api_version=None, kind=None, **kwargs):
         pass
 
     def get_resources_for_api_version(self, prefix, group, version, preferred):
@@ -376,35 +377,100 @@ class Discoverer(object):
             )
         return resources
 
-    def default_groups(self, getResources=False):
-        groups = {}
-        groups['api'] = { '': {
-            'v1': self.get_resources_for_api_version('api', '', 'v1', True) if getResources else {}
-        }}
-
-        # TODO probably shouldn't rely on client field
-        if self.client.version.get('openshift'):
-            groups['oapi'] = { '': {
-                'v1': self.get_resources_for_api_version('oapi', '', 'v1', True) if getResources else {}
-            }}
-
-        return groups
 
 
 
 class LazyDiscoverer(Discoverer):
+    class ResourceGroup(object):
+        def __init__(self, preferred, resources={}):
+            self.preferred = preferred
+            self.resources = resources
 
     def __init__(self, client):
         self.client = client
+        self.__resources = self.__setup_resources()
 
     def api_groups(self):
-        pass
+        return self.__resources['apis'].keys()
 
-    def get(self, kind=None, api_version=None, prefix=None, **kwargs):
-        pass
+    def get(self, **kwargs):
+        """ Same as search, but will throw an error if there are multiple or no
+            results. If there are multiple results and only one is an exact match
+            on api_version, that resource will be returned.
+        """
+        results = self.search(**kwargs)
+        if len(results) > 1 and kwargs.get('api_version'):
+            results = [
+                result for result in results if result.group_version == kwargs['api_version']
+            ]
+        if len(results) == 1:
+            return results[0]
+        elif not results:
+            raise ResourceNotFoundError('No matches found for {}'.format(kwargs))
+        else:
+            raise ResourceNotUniqueError('Multiple matches found for {}: {}'.format(kwargs, results))
 
-    def search(self, kind=None, api_version=None, prefix=None, **kwargs):
-        pass
+    def search(self, **kwargs):
+        return self.__search(self.__build_search(**kwargs), self.__resources, [])
+
+    def __search(self,  parts, resources, reqParams):
+        part = parts[0]
+        if part != '*':
+            resourcePart = resources.get(part)
+            if not resourcePart:
+                return []
+            elif isinstance(resourcePart, self.ResourceGroup):
+                assert len(reqParams) == 2, "prefix and group params should be present, have %s" % reqParams
+                if not resourcePart.resources:
+                    resourcePart.resources = self.get_resources_for_api_version(reqParams[0], reqParams[1], part, resourcePart.preferred)
+                return self.__search(parts[1:], resourcePart.resources, reqParams)
+            elif isinstance(resourcePart, dict):
+                return self.__search(parts[1:], resourcePart, reqParams + [parts[0]] )
+            else:
+                if parts[1] != '*' and isinstance(parts[1], dict):
+                    for term, value in parts[1].items():
+                        if getattr(resourcePart, term) == value:
+                            return [resourcePart]
+                else:
+                    return [resourcePart]
+        else:
+            matches = []
+            for key in resources.keys():
+                matches.extend(self.__search([key] + parts[1:], resources, reqParams))
+            return matches
+
+    def __build_search(self, prefix=None, group=None, api_version=None, kind=None, **kwargs):
+        if not group and api_version and '/' in api_version:
+            group, api_version = api_version.split('/')
+
+        items = [prefix, group, api_version, kind, kwargs]
+        return list(map(lambda x: x or '*', items))
+
+    def __setup_resources(self):
+        groups = {}
+        groups['api'] = { '': {
+            'v1': self.ResourceGroup(True)
+        }}
+
+
+        if self.client.version.get('openshift'):
+            groups['oapi'] = { '': {
+                'v1': self.ResourceGroup(True)
+            }}
+
+        prefix = 'apis'
+        groups['apis'] = {}
+        groups_response = load_json(self.client.request('GET', '/{}'.format(prefix)))['groups']
+
+        for group in groups_response:
+            new_group = {}
+            for version_raw in group['versions']:
+                version = version_raw['version']
+                preferred = version_raw == group['preferredVersion']
+                new_group[version] = self.ResourceGroup(preferred)
+            groups[prefix][group['name']] = new_group
+
+        return groups
 
 
 class EagerDiscoverer(Discoverer):
@@ -436,6 +502,18 @@ class EagerDiscoverer(Discoverer):
             groups[prefix][group['name']] = new_group
         return groups
 
+    def default_groups(self):
+        groups = {}
+        groups['api'] = { '': {
+            'v1': self.get_resources_for_api_version('api', '', 'v1', True)
+        }}
+
+        if self.client.version.get('openshift'):
+            groups['oapi'] = { '': {
+                'v1': self.get_resources_for_api_version('oapi', '', 'v1', True)
+            }}
+
+        return groups
 
     @property
     def api_groups(self):
@@ -475,11 +553,9 @@ class EagerDiscoverer(Discoverer):
 
     def __build_search(self, prefix=None, group=None, api_version=None, kind=None, **kwargs):
         if not group and api_version and '/' in api_version:
-            group, version = api_version.split('/')
-            items = [prefix, group, version, kind, kwargs]
-        else:
-            items = [prefix, group, api_version, kind, kwargs]
+            group, api_version = api_version.split('/')
 
+        items = [prefix, group, api_version, kind, kwargs]
         return list(map(lambda x: x or '*', items))
 
     def __search(self, parts, resources):
