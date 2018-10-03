@@ -65,6 +65,7 @@ class DynamicClient(object):
         # Setting default here to delay evaluation of LazyDiscoverer class
         # until constructor is called
         discoverer = discoverer or LazyDiscoverer
+
         self.client = client
         self.__discoverer = discoverer(self)
         self.configuration = client.configuration
