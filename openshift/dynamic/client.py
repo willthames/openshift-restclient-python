@@ -27,6 +27,7 @@ __all__ = [
     'Resource',
     'Subresource',
     'EagerDiscoverer',
+    'LazyDiscoverer',
     'ResourceField',
 ]
 
@@ -65,16 +66,11 @@ class DynamicClient(object):
     def __init__(self, client, discoverer=None):
         self.client = client
         self.configuration = client.configuration
-        self._load_server_info()
-        import pdb; pdb.set_trace()
-        self.__discoverer = discoverer or LazyDiscoverer(self)
+        # Setting default here to delay evaluation of LazyDiscoverer class
+        # until constructor is called
+        discoverer = discoverer or LazyDiscoverer
+        self.__discoverer = discoverer(self)
 
-    def _load_server_info(self):
-        self.__version = {'kubernetes': load_json(self.request('get', '/version'))}
-        try:
-            self.__version['openshift'] = load_json(self.request('get', '/version/openshift'))
-        except ApiException:
-            pass
 
     @property
     def resources(self):
@@ -82,7 +78,7 @@ class DynamicClient(object):
 
     @property
     def version(self):
-        return self.__version
+        return self.__discoverer.version
 
     def ensure_namespace(self, resource, namespace, body):
         namespace = namespace or body.get('metadata', {}).get('namespace')
@@ -196,7 +192,7 @@ class DynamicClient(object):
             header_params,
             body=body,
             post_params=form_params,
-            async=params.get('async'),
+            async_req=params.get('async_req'),
             files=local_var_files,
             auth_settings=auth_settings,
             _preload_content=False,
@@ -331,6 +327,16 @@ class Subresource(Resource):
 
 
 class Discoverer(object):
+    """
+        A convenient container for storing discovered API resources. Allows
+        easy searching and retrieval of specific resources.
+
+        Subclasses implement the abstract methods with different loading strategies.
+    """
+
+    def __init__(self, client):
+        self.client = client
+        self._load_server_info()
 
     @abstractproperty
     def api_groups(self):
@@ -344,8 +350,19 @@ class Discoverer(object):
     def search(self, prefix=None, group=None, api_version=None, kind=None, **kwargs):
         pass
 
+    @property
+    def version(self):
+        return self.__version
+
+    def _load_server_info(self):
+        self.__version = {'kubernetes': load_json(self.client.request('get', '/version'))}
+        try:
+            self.__version['openshift'] = load_json(self.client.request('get', '/version/openshift'))
+        except ApiException:
+            pass
+
     def get_resources_for_api_version(self, prefix, group, version, preferred):
-        """ returns a dictionary of resources associated with provided groupVersion"""
+        """ returns a dictionary of resources associated with provided (prefix, group, version)"""
 
         resources = {}
         subresources = {}
@@ -370,7 +387,7 @@ class Discoverer(object):
                 prefix=prefix,
                 group=group,
                 api_version=version,
-                client=self,
+                client=self.client,
                 preferred=preferred,
                 subresources=subresources.get(resource['name']),
                 **resource
@@ -378,17 +395,22 @@ class Discoverer(object):
         return resources
 
 
-
-
 class LazyDiscoverer(Discoverer):
+    """ A convenient container for storing discovered API resources. Allows
+        easy searching and retrieval of specific resources.
+
+        Resources for the cluster are loaded lazily.
+    """
+
     class ResourceGroup(object):
         def __init__(self, preferred, resources={}):
             self.preferred = preferred
             self.resources = resources
 
     def __init__(self, client):
-        self.client = client
+        Discoverer.__init__(self,client)
         self.__resources = self.__setup_resources()
+
 
     def api_groups(self):
         return self.__resources['apis'].keys()
@@ -422,7 +444,8 @@ class LazyDiscoverer(Discoverer):
             elif isinstance(resourcePart, self.ResourceGroup):
                 assert len(reqParams) == 2, "prefix and group params should be present, have %s" % reqParams
                 if not resourcePart.resources:
-                    resourcePart.resources = self.get_resources_for_api_version(reqParams[0], reqParams[1], part, resourcePart.preferred)
+                    resourcePart.resources = self.get_resources_for_api_version(reqParams[0],
+                        reqParams[1], part, resourcePart.preferred)
                 return self.__search(parts[1:], resourcePart.resources, reqParams)
             elif isinstance(resourcePart, dict):
                 return self.__search(parts[1:], resourcePart, reqParams + [parts[0]] )
@@ -446,6 +469,7 @@ class LazyDiscoverer(Discoverer):
         items = [prefix, group, api_version, kind, kwargs]
         return list(map(lambda x: x or '*', items))
 
+
     def __setup_resources(self):
         groups = {}
         groups['api'] = { '': {
@@ -453,7 +477,7 @@ class LazyDiscoverer(Discoverer):
         }}
 
 
-        if self.client.version.get('openshift'):
+        if self.version.get('openshift'):
             groups['oapi'] = { '': {
                 'v1': self.ResourceGroup(True)
             }}
@@ -475,11 +499,13 @@ class LazyDiscoverer(Discoverer):
 
 class EagerDiscoverer(Discoverer):
     """ A convenient container for storing discovered API resources. Allows
-        easy searching and retrieval of specific resources
+        easy searching and retrieval of specific resources.
+
+        All resources are discovered for the cluster upon object instantiation.
     """
 
     def __init__(self, client):
-        self.client = client
+        Discoverer.__init__(self,client)
         self.discover()
 
     def discover(self):
@@ -688,6 +714,7 @@ def main():
 
     print(yaml.safe_dump(ret))
     return 0
+
 
 
 if __name__ == '__main__':
