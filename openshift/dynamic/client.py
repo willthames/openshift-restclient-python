@@ -46,13 +46,11 @@ def meta_request(func):
 
     return inner
 
-
 def serialize(resource, response):
     try:
         return ResourceInstance(resource, load_json(response))
     except ValueError:
         return response.data.decode()
-
 
 def load_json(response):
     return json.loads(response.data.decode())
@@ -714,7 +712,6 @@ def main():
 
     print(yaml.safe_dump(ret))
     return 0
-
 
 
 if __name__ == '__main__':
