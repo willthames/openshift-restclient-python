@@ -534,7 +534,7 @@ class EagerDiscoverer(Discoverer):
             'v1': self.get_resources_for_api_version('api', '', 'v1', True)
         }}
 
-        if self.client.version.get('openshift'):
+        if self.version.get('openshift'):
             groups['oapi'] = { '': {
                 'v1': self.get_resources_for_api_version('oapi', '', 'v1', True)
             }}
