@@ -441,11 +441,14 @@ class LazyDiscoverer(Discoverer):
                 return []
             elif isinstance(resourcePart, self.ResourceGroup):
                 assert len(reqParams) == 2, "prefix and group params should be present, have %s" % reqParams
+                # Check if we've requested resources for this group
                 if not resourcePart.resources:
                     resourcePart.resources = self.get_resources_for_api_version(reqParams[0],
                         reqParams[1], part, resourcePart.preferred)
                 return self.__search(parts[1:], resourcePart.resources, reqParams)
             elif isinstance(resourcePart, dict):
+                # In this case parts [0] will be a specified prefix, group, version
+                # as we recurse
                 return self.__search(parts[1:], resourcePart, reqParams + [parts[0]] )
             else:
                 if parts[1] != '*' and isinstance(parts[1], dict):
@@ -543,7 +546,6 @@ class EagerDiscoverer(Discoverer):
     def api_groups(self):
         """ list available api groups """
         return self.__resources['apis'].keys()
-
 
     def get(self, **kwargs):
         """ Same as search, but will throw an error if there are multiple or no
