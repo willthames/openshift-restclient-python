@@ -65,8 +65,8 @@ class DynamicClient(object):
         # Setting default here to delay evaluation of LazyDiscoverer class
         # until constructor is called
         discoverer = discoverer or LazyDiscoverer
-        self.__discoverer = discoverer(self)
         self.client = client
+        self.__discoverer = discoverer(self)
         self.configuration = client.configuration
 
 
@@ -454,7 +454,7 @@ class LazyDiscoverer(Discoverer):
                 return []
             elif isinstance(resourcePart, self.ResourceGroup):
                 if len(reqParams) != 2:
-                    raise ValueError("prefix and group params should be present, have %s" % reqParams
+                    raise ValueError("prefix and group params should be present, have %s" % reqParams)
                 # Check if we've requested resources for this group
                 if not resourcePart.resources:
                     resourcePart.resources = self.get_resources_for_api_version(reqParams[0],
