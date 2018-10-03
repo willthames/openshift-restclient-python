@@ -62,12 +62,12 @@ class DynamicClient(object):
     """
 
     def __init__(self, client, discoverer=None):
-        self.client = client
-        self.configuration = client.configuration
         # Setting default here to delay evaluation of LazyDiscoverer class
         # until constructor is called
         discoverer = discoverer or LazyDiscoverer
         self.__discoverer = discoverer(self)
+        self.client = client
+        self.configuration = client.configuration
 
 
     @property
